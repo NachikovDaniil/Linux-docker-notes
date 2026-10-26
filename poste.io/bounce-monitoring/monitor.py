@@ -5,6 +5,7 @@ import time
 import hashlib
 import urllib.request
 import urllib.parse
+
 from pathlib import Path
 from datetime import datetime
 
@@ -16,27 +17,46 @@ from datetime import datetime
 LOG_ROOT = Path("/poste-logs")
 STATE_FILE = Path("/state/processed.json")
 
+STATE_VERSION = 5
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "5"))
+CHECK_INTERVAL = max(1, int(os.getenv("CHECK_INTERVAL", "5")))
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 LOCAL_DOMAINS = {
-    x.strip().lower()
-    for x in os.getenv("LOCAL_DOMAINS", "").split(",")
-    if x.strip()
+    domain.strip().lower()
+    for domain in os.getenv("LOCAL_DOMAINS", "").split(",")
+    if domain.strip()
 }
 
 
 # ============================================================
-# Regex / constants
+# Regex
 # ============================================================
 
 EMAIL_RE = re.compile(
     r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
     re.IGNORECASE,
 )
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+def log(message):
+    print(
+        f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+        f"{message}",
+        flush=True,
+    )
+
+
+def debug(message):
+    if DEBUG:
+        log(message)
 
 
 # ============================================================
@@ -47,29 +67,61 @@ def load_state():
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     if not STATE_FILE.exists():
-        return {"processed": {}, "initialized": False}
+        return {
+            "processed": {},
+            "initialized": False,
+        }
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            data.setdefault("processed", {})
-            data.setdefault("initialized", False)
-            return data
-    except Exception as e:
-        print(f"Error loading state: {e}")
-        return {"processed": {}, "initialized": False}
+        with STATE_FILE.open("r", encoding="utf-8") as file:
+            state = json.load(file)
+
+        if not isinstance(state, dict):
+            raise ValueError("State root must be a JSON object")
+
+        processed = state.setdefault("processed", {})
+
+        if not isinstance(processed, dict):
+            raise ValueError("'processed' must be a JSON object")
+
+        state.setdefault("initialized", False)
+
+        return state
+
+    except Exception as error:
+        # Не сбрасываем повреждённое состояние автоматически.
+        # Иначе можно потерять историю обработки.
+        raise RuntimeError(
+            f"Cannot load state from {STATE_FILE}: {error}"
+        ) from error
 
 
 def save_state(state):
-    try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        tmp = STATE_FILE.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        tmp.replace(STATE_FILE)
-    except Exception as e:
-        print(f"Error saving state: {e}")
+    temporary_file = STATE_FILE.with_suffix(".tmp")
+
+    try:
+        with temporary_file.open("w", encoding="utf-8") as file:
+            json.dump(
+                state,
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+            file.flush()
+            os.fsync(file.fileno())
+
+        temporary_file.replace(STATE_FILE)
+
+    except Exception as error:
+        log(
+            f"FATAL: cannot save state to {STATE_FILE}: {error}"
+        )
+
+        # Не продолжаем обработку без возможности сохранить историю.
+        raise SystemExit(1)
 
 
 # ============================================================
@@ -78,26 +130,49 @@ def save_state(state):
 
 def telegram_send(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured")
+        log(
+            "ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID "
+            "is not configured"
+        )
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
-    data = urllib.parse.urlencode({
+    payload = urllib.parse.urlencode({
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": "true",
-    }).encode()
+    }).encode("utf-8")
 
     try:
-        request = urllib.request.Request(url, data=data, method="POST")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            method="POST",
+        )
 
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return response.status == 200
+        with urllib.request.urlopen(
+            request,
+            timeout=15,
+        ) as response:
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
 
-    except Exception as e:
-        print(f"Telegram error: {e}")
+            if response.status == 200 and result.get("ok"):
+                return True
+
+            log(
+                "Telegram rejected the message: "
+                f"{result.get('description', 'unknown error')}"
+            )
+
+    except Exception as error:
+        log(f"Telegram error: {error}")
 
     return False
 
@@ -110,12 +185,7 @@ def normalize_email(value):
     if not value:
         return ""
 
-    value = str(value).strip().strip("<>").strip().lower()
-
-    if value in ("<>", ""):
-        return ""
-
-    return value
+    return str(value).strip().strip("<>").strip().lower()
 
 
 def is_local_sender(sender):
@@ -125,6 +195,7 @@ def is_local_sender(sender):
         return False
 
     domain = sender.split("@", 1)[1]
+
     return domain in LOCAL_DOMAINS
 
 
@@ -138,26 +209,52 @@ def safe_html(value):
 
 
 def format_time(timestamp):
+    if not timestamp:
+        return "не указано"
+
     try:
-        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        return dt.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+        date = datetime.fromisoformat(
+            str(timestamp).replace("Z", "+00:00")
+        )
+
+        return date.astimezone().strftime(
+            "%d.%m.%Y %H:%M:%S"
+        )
+
     except Exception:
-        return timestamp
+        return str(timestamp)
 
 
 def event_id(*values):
-    raw = "|".join(str(x) for x in values)
-    return hashlib.sha256(raw.encode()).hexdigest()
+    raw = "|".join(str(value) for value in values)
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
 
 
 def parse_json_objects(content):
-    objects = []
-
+    """
+    Поддерживает один JSON-объект или JSON-объекты построчно.
+    Возвращает только словари.
+    """
     try:
-        objects.append(json.loads(content))
-        return objects
+        value = json.loads(content)
+
+        if isinstance(value, dict):
+            return [value]
+
+        if isinstance(value, list):
+            return [
+                item
+                for item in value
+                if isinstance(item, dict)
+            ]
+
     except json.JSONDecodeError:
         pass
+
+    objects = []
 
     for line in content.splitlines():
         line = line.strip()
@@ -166,11 +263,22 @@ def parse_json_objects(content):
             continue
 
         try:
-            objects.append(json.loads(line))
+            value = json.loads(line)
+
+            if isinstance(value, dict):
+                objects.append(value)
+
         except json.JSONDecodeError:
-            pass
+            continue
 
     return objects
+
+
+def mark_processed(state, key, **details):
+    state["processed"][key] = {
+        "time": time.time(),
+        **details,
+    }
 
 
 # ============================================================
@@ -181,106 +289,120 @@ def parse_tx_file(path):
     """
     Возвращает (sender, recipients).
 
-    Фактический формат Poste.io tx .results:
-
+    Основной формат:
     {
-      "mail_from": {
-        "address": "sender@example.com"
-      },
-      "rcpt_to": {
-        "recipient": [
-          {
-            "address": "recipient@example.com"
-          }
-        ]
-      }
+        "mail_from": {
+            "address": "sender@example.com"
+        },
+        "rcpt_to": {
+            "recipient": [
+                {"address": "recipient@example.com"}
+            ]
+        }
     }
     """
-    if not path or not path.exists():
+    if not path:
         return None, []
 
     sender = None
     recipients = []
 
     try:
-        content = path.read_text(encoding="utf-8", errors="replace").strip()
-    except Exception as e:
-        print(f"Error reading tx file {path}: {e}")
+        content = path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+
+    except Exception as error:
+        log(f"Error reading tx file {path}: {error}")
         return None, []
 
-    # 1. JSON tx .results — основной и точный формат
     if path.name.endswith(".results") or content.startswith("{"):
         for data in parse_json_objects(content):
             mail_from = data.get("mail_from")
 
             if isinstance(mail_from, dict):
-                sender = normalize_email(mail_from.get("address"))
+                sender = normalize_email(
+                    mail_from.get("address")
+                )
 
             rcpt_to = data.get("rcpt_to")
 
-            if isinstance(rcpt_to, dict):
-                rcpt_list = rcpt_to.get("recipient")
+            if not isinstance(rcpt_to, dict):
+                continue
 
-                if isinstance(rcpt_list, list):
-                    for item in rcpt_list:
-                        if isinstance(item, dict):
-                            address = normalize_email(item.get("address"))
+            recipient_list = rcpt_to.get("recipient")
 
-                            if address and address not in recipients:
-                                recipients.append(address)
+            if not isinstance(recipient_list, list):
+                continue
 
-                        elif isinstance(item, str):
-                            address = normalize_email(item)
-
-                            if address and address not in recipients:
-                                recipients.append(address)
-
-    # 2. Fallback для текстового tx-файла
-    if sender is None or not recipients:
-        try:
-            for line in content.splitlines():
-                if sender is None:
-                    match = re.search(
-                        r"sender\s+<([^>]+)>",
-                        line,
-                        re.IGNORECASE,
+            for item in recipient_list:
+                if isinstance(item, dict):
+                    address = normalize_email(
+                        item.get("address")
                     )
 
-                    if match:
-                        sender = normalize_email(match.group(1))
+                elif isinstance(item, str):
+                    address = normalize_email(item)
 
-                if not recipients:
-                    match = re.search(
-                        r"recipient\s+<([^>]+)>",
-                        line,
-                        re.IGNORECASE,
-                    )
+                else:
+                    continue
 
-                    if match:
-                        recipient = normalize_email(match.group(1))
+                if address and address not in recipients:
+                    recipients.append(address)
 
-                        if recipient and recipient not in recipients:
-                            recipients.append(recipient)
+    # Текстовый fallback.
+    need_text_recipients = not recipients
 
-        except Exception as e:
-            print(f"Error parsing text tx file {path}: {e}")
+    for line in content.splitlines():
+        if sender is None:
+            match = re.search(
+                r"sender\s+<([^>]+)>",
+                line,
+                re.IGNORECASE,
+            )
+
+            if match:
+                sender = normalize_email(match.group(1))
+
+        if need_text_recipients:
+            match = re.search(
+                r"recipient\s+<([^>]+)>",
+                line,
+                re.IGNORECASE,
+            )
+
+            if match:
+                address = normalize_email(match.group(1))
+
+                if address and address not in recipients:
+                    recipients.append(address)
 
     return sender, recipients
 
 
 def find_tx_file(txid):
     """
-    Ищет tx-файл Poste.io.
-
-    Реальные варианты:
+    Возможные пути:
       delivery/tx/<a>/<b>/<TXID>.1
       delivery/tx/<a>/<b>/<TXID>.1.results
     """
-    if len(txid) < 2:
+    base_txid = (
+        txid.rsplit(".", 1)[0]
+        if "." in txid
+        else txid
+    )
+
+    if len(base_txid) < 2:
         return None
 
-    base_txid = txid.rsplit(".", 1)[0] if "." in txid else txid
-    directory = LOG_ROOT / "delivery" / "tx" / base_txid[0] / base_txid[1]
+    directory = (
+        LOG_ROOT
+        / "delivery"
+        / "tx"
+        / base_txid[0]
+        / base_txid[1]
+    )
 
     candidates = [
         directory / f"{base_txid}.1.results",
@@ -290,15 +412,20 @@ def find_tx_file(txid):
     ]
 
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.is_file():
             return candidate
 
     try:
-        matches = sorted(directory.glob(f"{base_txid}*"))
+        matches = sorted(
+            path
+            for path in directory.glob(f"{base_txid}*")
+            if path.is_file()
+        )
 
         results = [
-            x for x in matches
-            if x.name.endswith(".results")
+            path
+            for path in matches
+            if path.name.endswith(".results")
         ]
 
         if results:
@@ -306,21 +433,18 @@ def find_tx_file(txid):
 
         if matches:
             return matches[0]
-    except Exception as e:
-        print(f"Error searching tx files for {txid}: {e}")
+
+    except Exception as error:
+        log(f"Error searching tx files for {txid}: {error}")
 
     return None
 
 
 # ============================================================
-# Sender / recipients из del .results
+# Sender / recipients from delivery results
 # ============================================================
 
 def extract_sender_from_event(event):
-    """
-    Fallback: sender из del .results.
-    В текущем формате Poste.io там обычно его нет.
-    """
     data = event.get("data", {})
 
     if not isinstance(data, dict):
@@ -330,20 +454,14 @@ def extract_sender_from_event(event):
         for key in ("sender", "mail_from", "return_path"):
             value = source.get(key)
 
+            if isinstance(value, dict):
+                value = value.get("address")
+
             if isinstance(value, str):
                 emails = EMAIL_RE.findall(value)
 
                 if emails:
                     return normalize_email(emails[0])
-
-            elif isinstance(value, dict):
-                address = value.get("address")
-
-                if isinstance(address, str):
-                    emails = EMAIL_RE.findall(address)
-
-                    if emails:
-                        return normalize_email(emails[0])
 
     return None
 
@@ -351,9 +469,6 @@ def extract_sender_from_event(event):
 def extract_failed_recipients(event):
     """
     Возвращает (recipients, reason, smtp_code).
-
-    Получатели берутся только из bounced_rcpt / failed_rcpt /
-    failed / deferred_rcpt текущего bounce-события.
     """
     recipients = []
     reason = ""
@@ -365,10 +480,14 @@ def extract_failed_recipients(event):
         data = {}
 
     def add_recipient(value):
-        value = normalize_email(value)
+        address = normalize_email(value)
 
-        if value and "@" in value and value not in recipients:
-            recipients.append(value)
+        if (
+            address
+            and "@" in address
+            and address not in recipients
+        ):
+            recipients.append(address)
 
     recipient_containers = [
         data.get("bounced_rcpt"),
@@ -393,7 +512,13 @@ def extract_failed_recipients(event):
             if not isinstance(item, dict):
                 continue
 
-            for key in ("original", "address", "rcpt", "recipient", "email"):
+            for key in (
+                "original",
+                "address",
+                "rcpt",
+                "recipient",
+                "email",
+            ):
                 if key in item:
                     add_recipient(item[key])
 
@@ -408,15 +533,14 @@ def extract_failed_recipients(event):
             if not smtp_code:
                 smtp_code = item.get("dsn_smtp_code") or ""
 
-    # Fallback: адрес иногда есть только в тексте ошибки
-    err = data.get("err", "") or event.get("err", "")
+    error_text = data.get("err") or event.get("err") or ""
 
-    if not recipients and isinstance(err, str):
-        for email in EMAIL_RE.findall(err):
+    if not recipients and isinstance(error_text, str):
+        for email in EMAIL_RE.findall(error_text):
             add_recipient(email)
 
     if not reason:
-        reason = err
+        reason = error_text
 
     return recipients, reason, smtp_code
 
@@ -436,7 +560,11 @@ def notify_bounce(
     if isinstance(recipients, str):
         recipients = [recipients] if recipients else []
 
-    recipients = [r for r in recipients if r]
+    recipients = [
+        recipient
+        for recipient in recipients
+        if recipient
+    ]
 
     if recipients:
         recipients_text = "\n".join(
@@ -446,22 +574,28 @@ def notify_bounce(
     else:
         recipients_text = "не определён"
 
-    sender_text = safe_html(sender) if sender else "не определён"
+    sender_text = (
+        safe_html(sender)
+        if sender
+        else "не определён"
+    )
+
     reason_text = safe_html(reason or "не указана")
-    time_text = format_time(date_str)
+    time_text = safe_html(format_time(date_str))
 
     message = (
-        f"🚨 <b>POSTE.IO — ПИСЬМО НЕ ДОСТАВЛЕНО</b>\n\n"
+        "🚨 <b>POSTE.IO — ПИСЬМО НЕ ДОСТАВЛЕНО</b>\n\n"
         f"📤 <b>От:</b>\n{sender_text}\n\n"
         f"📥 <b>Кому:</b>\n{recipients_text}\n\n"
         f"🕐 <b>Время:</b>\n{time_text}\n\n"
         f"💬 <b>Причина:</b>\n{reason_text}\n\n"
-        f"🆔 <b>Transaction:</b>\n<code>{safe_html(txid)}</code>"
+        f"🆔 <b>Transaction:</b>\n"
+        f"<code>{safe_html(txid)}</code>"
     )
 
     if result_path:
         message += (
-            f"\n\n🗂 <b>Result:</b>\n"
+            "\n\n🗂 <b>Result:</b>\n"
             f"<code>{safe_html(result_path)}</code>"
         )
 
@@ -469,93 +603,107 @@ def notify_bounce(
 
 
 # ============================================================
-# Scan bounce results
+# Scan delivery results
 # ============================================================
 
 def get_bounce_result_files():
     base = LOG_ROOT / "delivery" / "del"
 
-    if not base.exists():
-        return []
+    if not base.is_dir():
+        raise RuntimeError(
+            f"Delivery log directory is unavailable: {base}. "
+            "Check the log volume mount."
+        )
 
-    files = list(base.glob("*/*/*.results"))
+    files = []
 
-    return sorted(files, key=lambda path: path.stat().st_mtime)
+    for path in base.glob("*/*/*.results"):
+        try:
+            if path.is_file():
+                files.append((
+                    path.stat().st_mtime_ns,
+                    str(path),
+                    path,
+                ))
+
+        except FileNotFoundError:
+            # Файл мог исчезнуть во время обхода.
+            continue
+
+    files.sort(key=lambda item: (item[0], item[1]))
+
+    return [item[2] for item in files]
 
 
 def process_bounce_result(path, state):
-    processed = state.setdefault("processed", {})
+    processed = state["processed"]
     file_key = str(path)
 
     if file_key in processed:
-        if DEBUG:
-            print(f"  skip (already processed): {file_key}")
+        debug(f"Skip already processed: {file_key}")
         return 0
 
     try:
-        content = path.read_text(encoding="utf-8", errors="replace").strip()
-    except Exception as e:
-        print(f"Error reading {path}: {e}")
+        content = path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+
+    except Exception as error:
+        log(f"Error reading {path}: {error}")
         return 0
 
-    if DEBUG:
-        print(f"RESULT FILE: {path}")
-        print(f"  content: {content}")
+    debug(f"RESULT FILE: {path}")
+    debug(f"Content: {content}")
 
+    # Пустой или пока не читающийся JSON не помечаем обработанным:
+    # файл может ещё записываться.
     if not content:
-        processed[file_key] = {
-            "time": time.time(),
-            "empty": True,
-        }
+        debug(f"Empty result file, retry later: {path}")
         return 0
 
     events = parse_json_objects(content)
 
     if not events:
-        processed[file_key] = {
-            "time": time.time(),
-            "unparsed": True,
-        }
+        debug(f"No JSON events, retry later: {path}")
         return 0
 
-    # Берём последнее событие bounced/rejected.
-    # До него могут быть deferred-события.
     bounce_event = None
-    date_str = ""
 
     for event in events:
-        result_type = (event.get("type") or "").lower()
+        result_type = str(event.get("type") or "").lower()
 
         if result_type in ("bounced", "rejected"):
             bounce_event = event
-            date_str = event.get("date", date_str)
 
     if bounce_event is None:
-        processed[file_key] = {
-            "time": time.time(),
-            "type": events[-1].get("type", ""),
-        }
+        # Deferred или другой промежуточный результат:
+        # перечитаем файл на следующем проходе.
+        debug(f"No bounced/rejected event yet: {path}")
         return 0
 
-    result_type = (bounce_event.get("type") or "").lower()
+    result_type = str(
+        bounce_event.get("type") or ""
+    ).lower()
+
+    date_str = bounce_event.get("date") or ""
     txid = path.name[:-len(".results")]
 
-    # 1. Sender и исходные получатели из tx
     tx_path = find_tx_file(txid)
     tx_sender, tx_recipients = parse_tx_file(tx_path)
 
-    # 2. Sender fallback из del .results
-    sender = tx_sender or extract_sender_from_event(bounce_event)
+    sender = (
+        tx_sender
+        or extract_sender_from_event(bounce_event)
+    )
 
-    # 3. Получатели из bounce/failed события
-    recipients, reason, smtp_code = extract_failed_recipients(bounce_event)
+    recipients, reason, smtp_code = (
+        extract_failed_recipients(bounce_event)
+    )
 
-    # 4. Если в del .results получателей нет,
-    #    используем исходных получателей из tx
     if not recipients:
         recipients = list(tx_recipients)
 
-    # 5. Отправитель не должен быть в получателях
     if sender:
         recipients = [
             recipient
@@ -563,30 +711,38 @@ def process_bounce_result(path, state):
             if recipient != sender
         ]
 
-    if DEBUG:
-        print(f"  BOUNCE: txid={txid}")
-        print(f"  type={result_type}")
-        print(f"  tx file={tx_path}")
-        print(f"  tx sender={tx_sender}")
-        print(f"  tx recipients={tx_recipients}")
-        print(f"  final sender={sender}")
-        print(f"  final recipients={recipients}")
-        print(f"  reason={reason}")
-        print(f"  smtp_code={smtp_code}")
+    debug(f"BOUNCE: txid={txid}")
+    debug(f"Type: {result_type}")
+    debug(f"TX file: {tx_path}")
+    debug(f"Sender: {sender}")
+    debug(f"Recipients: {recipients}")
+    debug(f"Reason: {reason}")
+    debug(f"SMTP code: {smtp_code}")
 
-    # Не отправляем уведомления для внешних отправителей,
-    # но события без определённого sender не теряем
+    # Сохраняем прежнее поведение:
+    # известный внешний отправитель пропускается,
+    # неизвестный отправитель не блокирует уведомление.
     if sender and not is_local_sender(sender):
-        if DEBUG:
-            print(f"  -> пропуск: sender не локальный ({sender})")
+        debug(f"Skip non-local sender: {sender}")
 
-        processed[file_key] = {
-            "time": time.time(),
-            "skipped": "non-local",
-        }
+        mark_processed(
+            state,
+            file_key,
+            skipped="non-local",
+        )
         return 0
 
     eid = event_id(
+        txid,
+        sender or "",
+        ",".join(sorted(recipients)),
+        reason,
+        result_type,
+    )
+
+    # Совместимость с хешами, которые сохраняла старая версия:
+    # в ней порядок получателей не сортировался.
+    legacy_eid = event_id(
         txid,
         sender or "",
         ",".join(recipients),
@@ -594,16 +750,19 @@ def process_bounce_result(path, state):
         result_type,
     )
 
-    if eid in processed:
-        processed[file_key] = {
-            "time": time.time(),
-            "eid": eid,
-        }
+    if eid in processed or legacy_eid in processed:
+        mark_processed(
+            state,
+            file_key,
+            eid=eid,
+            skipped="duplicate-event",
+        )
         return 0
 
-    print(
+    log(
         f"Delivery failure: txid={txid} "
-        f"sender={sender} -> {recipients} err={reason}"
+        f"sender={sender} -> {recipients} "
+        f"err={reason}"
     )
 
     sent = notify_bounce(
@@ -615,42 +774,75 @@ def process_bounce_result(path, state):
         result_path=path,
     )
 
-    if sent:
-        processed[file_key] = {
-            "time": time.time(),
-            "txid": txid,
-        }
+    if not sent:
+        # Не отмечаем обработанным:
+        # повторим отправку на следующем проходе.
+        return 0
 
-        processed[eid] = {
-            "time": time.time(),
-            "txid": txid,
-        }
+    mark_processed(
+        state,
+        file_key,
+        txid=txid,
+        eid=eid,
+    )
 
-        return 1
+    mark_processed(
+        state,
+        eid,
+        txid=txid,
+    )
 
-    return 0
+    # Сохраняем сразу после успешной отправки.
+    save_state(state)
+
+    return 1
 
 
 # ============================================================
-# Cleanup state
+# Initialization / migration
 # ============================================================
 
-def cleanup_state(state):
-    processed = state.get("processed", {})
+def initialize_state(state):
+    if (
+        state.get("initialized")
+        and state.get("dedup_version") == STATE_VERSION
+    ):
+        return
+
+    log(
+        "Initializing v5: marking existing result files "
+        "as processed without notifications..."
+    )
+
+    processed = state["processed"]
     now = time.time()
-    remove = []
+    count = 0
 
-    for key, value in processed.items():
-        if not isinstance(value, dict):
-            continue
+    # Сначала получаем список целиком.
+    # Если каталог недоступен, инициализация не завершится.
+    paths = get_bounce_result_files()
 
-        created = value.get("time")
+    for path in paths:
+        file_key = str(path)
 
-        if created and now - created > 7 * 86400:
-            remove.append(key)
+        if file_key not in processed:
+            processed[file_key] = {
+                "time": now,
+                "boot_skip": True,
+            }
+            count += 1
 
-    for key in remove:
-        processed.pop(key, None)
+    state["initialized"] = True
+    state["dedup_version"] = STATE_VERSION
+    state["baseline_time"] = now
+
+    save_state(state)
+
+    log(
+        f"Initialization completed: "
+        f"{count} existing files marked as processed."
+    )
+    log("Waiting for new result files.")
 
 
 # ============================================================
@@ -658,52 +850,80 @@ def cleanup_state(state):
 # ============================================================
 
 def main():
-    print("=" * 60)
-    print("Poste.io Bounce Monitor (v4 - exact tx format)")
-    print("=" * 60)
-    print(f"Log root:       {LOG_ROOT}")
-    print(f"Local domains:  {LOCAL_DOMAINS}")
-    print(f"Interval:       {CHECK_INTERVAL}s")
-    print(f"Debug:          {DEBUG}")
-    print(
-        "Telegram:       "
-        + ("configured" if TELEGRAM_BOT_TOKEN else "NOT configured")
-    )
+    log("=" * 60)
+    log("Poste.io Bounce Monitor v5")
+    log("=" * 60)
+
+    log(f"Log root:      {LOG_ROOT}")
+    log(f"State file:    {STATE_FILE}")
+    log(f"Local domains: {', '.join(sorted(LOCAL_DOMAINS)) or '(empty)'}")
+    log(f"Interval:      {CHECK_INTERVAL}s")
+    log(f"Debug:         {DEBUG}")
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+            "must be configured"
+        )
+
+    if not LOCAL_DOMAINS:
+        raise RuntimeError(
+            "LOCAL_DOMAINS is empty. "
+            "Example: LOCAL_DOMAINS=example.com,example.org"
+        )
+
+    if not LOG_ROOT.is_dir():
+        raise RuntimeError(
+            f"Log root is unavailable: {LOG_ROOT}. "
+            "Check the container volume mount."
+        )
 
     state = load_state()
+    initialize_state(state)
 
-    if not state.get("initialized"):
-        print("First start: marking existing bounce results as processed...")
-
-        for path in get_bounce_result_files():
-            state["processed"][str(path)] = {
-                "time": time.time(),
-                "boot_skip": True,
-            }
-
-        state["initialized"] = True
-        save_state(state)
-
-        print("Initial state saved. Waiting for new bounces...")
+    log(
+        f"Loaded {len(state['processed'])} "
+        "processed file/event records."
+    )
 
     while True:
         try:
             total = 0
 
             for path in get_bounce_result_files():
-                total += process_bounce_result(path, state)
+                try:
+                    total += process_bounce_result(
+                        path,
+                        state,
+                    )
 
-            cleanup_state(state)
+                except Exception as error:
+                    log(
+                        f"Error processing {path}: {error}"
+                    )
+
+            # Сохраняем также отметки non-local и duplicate-event.
+            # Историю по возрасту НЕ удаляем.
             save_state(state)
 
             if total:
-                print(f"Sent {total} Telegram notification(s)")
+                log(
+                    f"Sent {total} Telegram notification(s)"
+                )
 
-        except Exception as e:
-            print(f"Main loop error: {e}")
+        except Exception as error:
+            log(f"Main loop error: {error}")
 
         time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        log("Stopped.")
+
+    except Exception as error:
+        log(f"FATAL: {error}")
+        raise SystemExit(1)
